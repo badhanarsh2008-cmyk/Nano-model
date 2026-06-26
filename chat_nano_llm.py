@@ -4,18 +4,18 @@ import sys
 
 import torch
 
-from train_nano_llm import CharTokenizer, NanoGPT
-
-
-def sanitize_prompt(prompt, tokenizer):
-    kept = [ch for ch in prompt if ch in tokenizer.stoi]
-    removed = sorted(set(ch for ch in prompt if ch not in tokenizer.stoi))
-    return "".join(kept), removed
+from train_nano_llm import BPETokenizer, NanoGPT
 
 
 def build_model(checkpoint_path, tokenizer, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     args = checkpoint["args"]
+    checkpoint_vocab_size = checkpoint.get("vocab_size")
+    if checkpoint_vocab_size is not None and checkpoint_vocab_size != tokenizer.vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab size ({tokenizer.vocab_size}) does not match "
+            f"checkpoint vocab size ({checkpoint_vocab_size})."
+        )
 
     model = NanoGPT(
         vocab_size=tokenizer.vocab_size,
@@ -47,9 +47,11 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     if not tokenizer_path.exists():
         raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
+    if tokenizer_path.stat().st_size == 0:
+        raise ValueError(f"Tokenizer file is empty: {tokenizer_path}")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = CharTokenizer.load(tokenizer_path)
+    tokenizer = BPETokenizer(tokenizer_path)
     model, train_args = build_model(checkpoint_path, tokenizer, device)
 
     print(f"Loaded checkpoint: {checkpoint_path}")
@@ -66,23 +68,17 @@ def main():
         if prompt.strip().lower() in {"exit", "quit"}:
             break
 
-        cleaned_prompt, removed = sanitize_prompt(prompt, tokenizer)
-        if not cleaned_prompt:
-            print("Model: I can't use that prompt because none of its characters are in the tokenizer.\n")
+        encoded = tokenizer.encode(prompt)
+        if not encoded:
+            print("Model: I can't use that prompt because it did not produce any tokens.\n")
             continue
 
-        if removed:
-            removed_text = "".join(removed)
-            print(f"[note] skipped unseen characters: {removed_text}")
-
-        encoded = tokenizer.encode(cleaned_prompt)
         context = torch.tensor([encoded], dtype=torch.long, device=device)
 
         with torch.no_grad():
             output = model.generate(context, max_new_tokens=args.max_new_tokens)[0].tolist()
 
-        generated = tokenizer.decode(output)
-        reply = generated[len(cleaned_prompt) :]
+        reply = tokenizer.decode(output[len(encoded) :])
         print(f"Model: {reply.strip()}\n")
 
 

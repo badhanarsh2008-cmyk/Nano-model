@@ -1,6 +1,5 @@
 from pathlib import Path
 import argparse
-import json
 import re
 import sys
 import time
@@ -10,6 +9,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from pypdf import PdfReader
 
+from tokenizers import Tokenizer
 
 def clean_text(text):
     replacements = {
@@ -49,36 +49,19 @@ def load_pdf_text(books_dir):
     return clean_text("\n".join(chunks))
 
 
-class CharTokenizer:
-    def __init__(self, text):
-        self.chars = sorted(set(text))
-        self.stoi = {ch: i for i, ch in enumerate(self.chars)}
-        self.itos = {i: ch for i, ch in enumerate(self.chars)}
-        self.vocab_size = len(self.chars)
-
-    @classmethod
-    def from_chars(cls, chars):
-        obj = cls.__new__(cls)
-        obj.chars = list(chars)
-        obj.stoi = {ch: i for i, ch in enumerate(obj.chars)}
-        obj.itos = {i: ch for i, ch in enumerate(obj.chars)}
-        obj.vocab_size = len(obj.chars)
-        return obj
+class BPETokenizer:
+    def __init__(self, path):
+        self.tokenizer = Tokenizer.from_file(str(path))
+        self.vocab_size = self.tokenizer.get_vocab_size()
 
     def encode(self, text):
-        return [self.stoi[ch] for ch in text]
+        return self.tokenizer.encode(text).ids
 
     def decode(self, ids):
-        return "".join(self.itos[int(i)] for i in ids)
+        return self.tokenizer.decode(ids)
 
     def save(self, path):
-        data = {"chars": self.chars}
-        Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    @classmethod
-    def load(cls, path):
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls.from_chars(data["chars"])
+        self.tokenizer.save(str(path))
 
 
 class Head(nn.Module):
@@ -224,9 +207,10 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    parser = argparse.ArgumentParser(description="Train a tiny character-level LLM on PDFs.")
+    parser = argparse.ArgumentParser(description="Train a tiny BPE-tokenized LLM on PDFs.")
     parser.add_argument("--books-dir", default="books")
     parser.add_argument("--out-dir", default="checkpoints")
+    parser.add_argument("--tokenizer", default="tokenizer.json")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-iters", type=int, default=2000)
@@ -245,11 +229,22 @@ def main():
     print(f"Using device: {device}")
 
     text = load_pdf_text(args.books_dir)
-    tokenizer = CharTokenizer(text)
+    tokenizer_path = Path(args.tokenizer)
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found: {tokenizer_path}. Run train_tokenizerr.py first."
+        )
+
+    tokenizer = BPETokenizer(tokenizer_path)
     print(f"Corpus characters: {len(text):,}")
     print(f"Vocabulary size: {tokenizer.vocab_size}")
 
     data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+    if len(data) <= args.block_size:
+        raise ValueError(
+            f"Tokenized data is too short ({len(data)} tokens) for block size {args.block_size}."
+        )
+
     split_at = int(0.9 * len(data))
     train_data = data[:split_at]
     val_data = data[split_at:]
